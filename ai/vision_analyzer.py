@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import io
+import re
 from datetime import datetime
 from PIL import Image, ImageEnhance
 
@@ -16,22 +17,29 @@ logger = logging.getLogger("mediread.ai")
 
 def preprocess_prescription_image(image_bytes: bytes) -> bytes:
     """
-    Applies image enhancement (contrast + sharpness boost)
+    Applies image enhancement (converting RGBA to RGB, contrast + sharpness boost)
     to make faded doctor handwriting and faint ink significantly easier to read.
     """
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
-            # Convert to RGB if needed
-            if img.mode != "RGB":
+            # Handle RGBA/transparent PNGs properly
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                background = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "RGBA":
+                    background.paste(img, mask=img.split()[3])
+                else:
+                    background.paste(img.convert("RGB"))
+                img = background
+            elif img.mode != "RGB":
                 img = img.convert("RGB")
 
             # Boost contrast slightly to make blue/black ink stand out from paper
             enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.35)
+            img = enhancer.enhance(1.25)
 
             # Boost sharpness to define cursive stroke edges
             sharpness_enhancer = ImageEnhance.Sharpness(img)
-            img = sharpness_enhancer.enhance(1.4)
+            img = sharpness_enhancer.enhance(1.3)
 
             # Save back to high quality JPEG
             output_buffer = io.BytesIO()
@@ -43,7 +51,7 @@ def preprocess_prescription_image(image_bytes: bytes) -> bytes:
 
 
 def get_mock_prescription_data() -> PrescriptionAnalysis:
-    """Fallback clinical mock used when GROQ_API_KEY is not configured."""
+    """Fallback clinical mock used only when GROQ_API_KEY is completely missing."""
     return PrescriptionAnalysis(
         documentReadable=True,
         isPrescription=True,
@@ -80,42 +88,15 @@ def get_mock_prescription_data() -> PrescriptionAnalysis:
                 purpose="Antipyretic & analgesic for fever and pain relief",
                 instructions="Maintain at least 6 hours gap between doses. Max 3 tablets/day.",
                 uncertainFields=[]
-            ),
-            Medicine(
-                name="Pan-D (Pantoprazole + Domperidone)",
-                strength="40 mg / 30 mg",
-                dosage="1 capsule",
-                frequency="OD",
-                frequencyDecoded="Once daily (दिन में 1 बार - सुबह खाली पेट)",
-                timing="Before breakfast (AC - नाश्ते से 30 मिनट पहले)",
-                duration="5 days",
-                purpose="Gastric acid reducer to prevent stomach irritation",
-                instructions="Take with half glass of plain water.",
-                uncertainFields=[]
-            ),
-            Medicine(
-                name="Montair-LC (Montelukast + Levocetirizine)",
-                strength=None,
-                dosage="1 tablet",
-                frequency="HS",
-                frequencyDecoded="At bedtime (रात को सोने से पहले)",
-                timing="Night time (सोने से पहले)",
-                duration="7 days",
-                purpose="Antiallergic for cough & runny nose",
-                instructions="May cause mild drowsiness. Avoid driving late night.",
-                uncertainFields=["strength"]
             )
         ],
         otherInstructions=[
             "Warm saline gargles 3 times daily for soothing the throat.",
-            "Stay well hydrated: consume 2.5-3 liters of warm water daily.",
-            "Follow-up in OPD after 5 days if fever persists."
+            "Stay well hydrated: consume 2.5-3 liters of warm water daily."
         ],
-        unclearText=[
-            "Doctor signature and lower registration seal partially faint."
-        ],
+        unclearText=[],
         needsHumanVerification=True,
-        summaryNote="Standard outpatient prescription for acute pharyngitis and fever. Decoded 4 medications with dosages and precautions.",
+        summaryNote="Standard outpatient prescription preview.",
         isMock=True,
         mockNotice="DEMO PREVIEW: Set your GROQ_API_KEY in ai/.env for live Groq vision transcription."
     )
@@ -153,26 +134,39 @@ async def analyze_prescription_image(image_bytes: bytes, mime_type: str = "image
         response = await vision_model.ainvoke(messages)
         raw_text = response.content if isinstance(response.content, str) else json.dumps(response.content)
 
+        # Robust JSON extraction
         clean_json = raw_text.strip()
-        if clean_json.startswith("```json"):
-            clean_json = clean_json[7:]
-        elif clean_json.startswith("```"):
-            clean_json = clean_json[3:]
-        if clean_json.endswith("```"):
-            clean_json = clean_json[:-3]
-        clean_json = clean_json.strip()
+        if "```json" in clean_json:
+            clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_json:
+            clean_json = clean_json.split("```")[1].split("```")[0].strip()
+
+        # Find first { and last }
+        first_brace = clean_json.find("{")
+        last_brace = clean_json.rfind("}")
+        if first_brace != -1 and last_brace != -1:
+            clean_json = clean_json[first_brace:last_brace + 1]
 
         parsed_dict = json.loads(clean_json)
 
+        # Decode shorthands
         if "medicines" in parsed_dict and isinstance(parsed_dict["medicines"], list):
             for med in parsed_dict["medicines"]:
-                if med.get("frequency") and not med.get("frequencyDecoded"):
-                    decoded = decode_shorthand(med["frequency"])
+                freq = med.get("frequency") or med.get("dosage") or ""
+                if not med.get("frequencyDecoded") and freq:
+                    decoded = decode_shorthand(freq)
                     if decoded:
                         med["frequencyDecoded"] = f"{decoded['meaning']} ({decoded['hindi']})"
+
+        # Ensure summaryNote exists
+        if not parsed_dict.get("summaryNote"):
+            doc = parsed_dict.get("doctorName") or "doctor"
+            cnt = len(parsed_dict.get("medicines") or [])
+            parsed_dict["summaryNote"] = f"Prescription by {doc} with {cnt} identified medications."
 
         validated = PrescriptionAnalysis(**parsed_dict)
         return validated
     except Exception as exc:
         logger.error(f"[MediRead AI] Vision analysis error: {exc}")
+        # If model failed or gave malformed output, don't crash
         raise
