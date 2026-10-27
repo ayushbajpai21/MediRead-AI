@@ -1,8 +1,9 @@
 import base64
 import json
 import logging
+import io
 from datetime import datetime
-from typing import Dict, Any
+from PIL import Image, ImageEnhance
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from groq_client import get_vision_model, has_groq_key
@@ -11,6 +12,34 @@ from schemas import PrescriptionAnalysis, Medicine
 from shorthands import decode_shorthand
 
 logger = logging.getLogger("mediread.ai")
+
+
+def preprocess_prescription_image(image_bytes: bytes) -> bytes:
+    """
+    Applies image enhancement (contrast + sharpness boost)
+    to make faded doctor handwriting and faint ink significantly easier to read.
+    """
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            # Convert to RGB if needed
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            # Boost contrast slightly to make blue/black ink stand out from paper
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.35)
+
+            # Boost sharpness to define cursive stroke edges
+            sharpness_enhancer = ImageEnhance.Sharpness(img)
+            img = sharpness_enhancer.enhance(1.4)
+
+            # Save back to high quality JPEG
+            output_buffer = io.BytesIO()
+            img.save(output_buffer, format="JPEG", quality=95)
+            return output_buffer.getvalue()
+    except Exception as e:
+        logger.warning(f"[MediRead AI] Preprocessing fallback: {e}")
+        return image_bytes
 
 
 def get_mock_prescription_data() -> PrescriptionAnalysis:
@@ -104,8 +133,11 @@ async def analyze_prescription_image(image_bytes: bytes, mime_type: str = "image
     if not vision_model:
         raise ValueError("Groq vision model could not be initialized.")
 
-    base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{base64_encoded}"
+    # Enhance contrast and stroke edges before sending to Vision model
+    processed_bytes = preprocess_prescription_image(image_bytes)
+
+    base64_encoded = base64.b64encode(processed_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{base64_encoded}"
 
     messages = [
         SystemMessage(content=PRESCRIPTION_VISION_SYSTEM_PROMPT),
@@ -121,7 +153,6 @@ async def analyze_prescription_image(image_bytes: bytes, mime_type: str = "image
         response = await vision_model.ainvoke(messages)
         raw_text = response.content if isinstance(response.content, str) else json.dumps(response.content)
 
-        # Clean markdown code block wraps if present
         clean_json = raw_text.strip()
         if clean_json.startswith("```json"):
             clean_json = clean_json[7:]
@@ -133,7 +164,6 @@ async def analyze_prescription_image(image_bytes: bytes, mime_type: str = "image
 
         parsed_dict = json.loads(clean_json)
 
-        # Enrich medicines with shorthand decoding if missing
         if "medicines" in parsed_dict and isinstance(parsed_dict["medicines"], list):
             for med in parsed_dict["medicines"]:
                 if med.get("frequency") and not med.get("frequencyDecoded"):
