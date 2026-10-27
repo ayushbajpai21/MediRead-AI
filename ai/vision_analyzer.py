@@ -17,8 +17,8 @@ logger = logging.getLogger("mediread.ai")
 
 def preprocess_prescription_image(image_bytes: bytes) -> bytes:
     """
-    Applies image enhancement (converting RGBA to RGB, contrast + sharpness boost)
-    to make faded doctor handwriting and faint ink significantly easier to read.
+    Optimizes and downscales image for minimal token usage while enhancing
+    contrast and stroke edges so Groq processes it with minimum tokens and maximum speed.
     """
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
@@ -33,6 +33,11 @@ def preprocess_prescription_image(image_bytes: bytes) -> bytes:
             elif img.mode != "RGB":
                 img = img.convert("RGB")
 
+            # Downscale large phone photos to max 1280px dimension to save tokens
+            max_dimension = 1280
+            if max(img.size) > max_dimension:
+                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+
             # Boost contrast slightly to make blue/black ink stand out from paper
             enhancer = ImageEnhance.Contrast(img)
             img = enhancer.enhance(1.25)
@@ -41,9 +46,9 @@ def preprocess_prescription_image(image_bytes: bytes) -> bytes:
             sharpness_enhancer = ImageEnhance.Sharpness(img)
             img = sharpness_enhancer.enhance(1.3)
 
-            # Save back to high quality JPEG
+            # Save back to optimized JPEG
             output_buffer = io.BytesIO()
-            img.save(output_buffer, format="JPEG", quality=95)
+            img.save(output_buffer, format="JPEG", quality=88, optimize=True)
             return output_buffer.getvalue()
     except Exception as e:
         logger.warning(f"[MediRead AI] Preprocessing fallback: {e}")
@@ -114,7 +119,7 @@ async def analyze_prescription_image(image_bytes: bytes, mime_type: str = "image
     if not vision_model:
         raise ValueError("Groq vision model could not be initialized.")
 
-    # Enhance contrast and stroke edges before sending to Vision model
+    # Enhance contrast and stroke edges, resize to save tokens
     processed_bytes = preprocess_prescription_image(image_bytes)
 
     base64_encoded = base64.b64encode(processed_bytes).decode("utf-8")
@@ -168,5 +173,4 @@ async def analyze_prescription_image(image_bytes: bytes, mime_type: str = "image
         return validated
     except Exception as exc:
         logger.error(f"[MediRead AI] Vision analysis error: {exc}")
-        # If model failed or gave malformed output, don't crash
         raise
